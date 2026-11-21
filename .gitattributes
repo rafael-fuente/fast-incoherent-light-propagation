@@ -1,2 +1,12 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep the finished notebooks and numerical sources byte-for-byte unchanged.
+*.ipynb -text
+*.py -text
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.cff text eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+*.npz binary

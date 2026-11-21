@@ -1,0 +1,2 @@
+# Install the local implementation and notebook dependencies.
+-e .[notebooks]

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "incoherent-light"
+version = "0.1.0"
+description = "Nonparaxial diffraction and inverse design under extended incoherent illumination"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Rafael de la Fuente Herrezuelo"}]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+    "Pillow>=10",
+    "progressbar2>=4",
+    "jax>=0.6.2",
+]
+keywords = ["diffraction", "incoherent-light", "inverse-design", "holography", "metasurfaces"]
+
+[project.optional-dependencies]
+notebooks = ["jupyterlab>=4", "ipython>=8", "ipykernel>=6"]
+dev = ["nbformat>=5.10", "PyYAML>=6"]
+lbfgs = ["jaxopt>=0.8"]
+
+[tool.setuptools]
+py-modules = ["vcsel_fig6", "vcsel_target", "flattop_fig7"]
+include-package-data = true
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["diffractsim", "diffractsim.*"]
+
+[tool.setuptools.package-data]
+diffractsim = ["data/*.txt"]
