@@ -77,6 +77,11 @@ Bibliographic metadata is also available in [CITATION.cff](CITATION.cff), which 
   doi           = {10.48550/arXiv.2611.27232},
   url           = {https://doi.org/10.48550/arXiv.2611.27232}
 }
+```
+---
 
 This work builds on [Diffractsim](https://github.com/rafael-fuente/diffractsim).
+
 ---
+
+Copyright © 2026 Rafael de la Fuente Herrezuelo  — [MPL 2.0](https://github.com/rafael-fuente/fast-incoherent-light-propagation/blob/main/LICENSE)
