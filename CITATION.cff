@@ -1,12 +1,5 @@
 cff-version: 1.2.0
 message: "If you use this code or method in your research, please cite the arXiv paper below."
-type: software
-title: "fast-incoherent-light-propagation"
-authors:
-  - given-names: "Rafael"
-    family-names: "de la Fuente Herrezuelo"
-repository-code: "https://github.com/rafael-fuente/fast-incoherent-light-propagation"
-
 preferred-citation:
   type: article
   authors:
@@ -22,3 +15,4 @@ preferred-citation:
     - type: other
       value: "arXiv:2611.27232"
       description: "arXiv identifier (physics.optics)"
+  repository-code: "https://github.com/rafael-fuente/fast-incoherent-light-propagation"
