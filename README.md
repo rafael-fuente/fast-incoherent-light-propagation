@@ -1,6 +1,7 @@
 # Efficient convolution-based nonparaxial propagation of partially coherent light
+[![DOI](https://zenodo.org/badge/DOI/10.48550/arXiv.2611.27232.svg)](https://doi.org/10.48550/arXiv.2611.27232)
 
-`fast-incoherent-light-propagation` provides robust research code and example notebooks for fast, wide-angle diffraction and inverse design under extended incoherent illumination. It implements the method developed in the [accompanying paper](paper/Efficient_convolution_based_nonparaxial_propagation_of_partially_coherent_light.pdf).
+`fast-incoherent-light-propagation` provides robust research code and example notebooks for fast, wide-angle diffraction and inverse design under extended incoherent illumination. It implements the method developed in the [paper](https://doi.org/10.48550/arXiv.2611.27232).
 
 The examples use simple **phase profiles and pupils** to keep the implementation simple, but these transmission models can be replaced by complex responses obtained from **full-wave electromagnetic simulations** such FDTD. 
 
