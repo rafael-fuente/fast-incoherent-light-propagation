@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this code or method in your research, please cite the arXiv paper below."
+type: software
+title: "fast-incoherent-light-propagation"
+authors:
+  - given-names: "Rafael"
+    family-names: "de la Fuente Herrezuelo"
+repository-code: "https://github.com/rafael-fuente/fast-incoherent-light-propagation"
+
+preferred-citation:
+  type: article
+  authors:
+    - given-names: "Rafael"
+      family-names: "de la Fuente Herrezuelo"
+  title: "Efficient convolution-based nonparaxial propagation of partially coherent light"
+  journal: "arXiv"
+  year: 2026
+  month: 11
+  doi: "10.48550/arXiv.2611.27232"
+  url: "https://arxiv.org/abs/2611.27232"
+  identifiers:
+    - type: other
+      value: "arXiv:2611.27232"
+      description: "arXiv identifier (physics.optics)"

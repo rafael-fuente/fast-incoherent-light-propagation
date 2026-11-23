@@ -60,10 +60,23 @@ JAX runs on the CPU by default. For GPU support, follow the [JAX installation gu
 
 ## Citation
 
-If you use this code and/or method in your research, please cite the accompanying manuscript:
+If you use this code or method in your research, please cite the paper.
 
-R. de la Fuente Herrezuelo, *Efficient convolution-based nonparaxial propagation of partially coherent light* (2026). [Paper](paper/Efficient_convolution_based_nonparaxial_propagation_of_partially_coherent_light.pdf) [BibTeX](paper/citation.bib).
+Rafael de la Fuente Herrezuelo, *Efficient convolution-based nonparaxial propagation of partially coherent light*. [https://doi.org/10.48550/arXiv.2611.27232](https://doi.org/10.48550/arXiv.2611.27232) [physics.optics] (2026).
 
 Bibliographic metadata is also available in [CITATION.cff](CITATION.cff), which GitHub reads automatically.
 
+```bibtex
+@misc{delafuenteherrezuelo2026nonparaxial,
+  author        = {de la Fuente Herrezuelo, Rafael},
+  title         = {Efficient convolution-based nonparaxial propagation of partially coherent light},
+  year          = {2026},
+  eprint        = {2611.27232},
+  archivePrefix = {arXiv},
+  primaryClass  = {physics.optics},
+  doi           = {10.48550/arXiv.2611.27232},
+  url           = {https://doi.org/10.48550/arXiv.2611.27232}
+}
+
 This work builds on [Diffractsim](https://github.com/rafael-fuente/diffractsim).
+---
