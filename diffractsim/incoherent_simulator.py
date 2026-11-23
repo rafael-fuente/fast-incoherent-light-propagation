@@ -1,7 +1,17 @@
-"""Incoherent propagation shared by monochromatic and polychromatic examples.
+"""Simulate diffraction from an extended, spatially incoherent source.
 
-Radiance functions supply the source. A coherent response and an intensity
-convolution then give the output, including compact collection regions.
+The fast calculation presented in this implementation uses this idea to sum light from a whole source [1].
+It computes one reference diffraction pattern, shifts it for each source
+direction and weights each copy by the radiance in that direction.
+A convolution evaluates the sum. At small angles, the shifts are measured
+in distances on the detector. At wide angles, they are measured in
+direction cosines.
+
+References
+----------
+[1] R. de la Fuente Herrezuelo, “Efficient convolution-based nonparaxial
+    propagation of partially coherent light” (2026). Equation and section
+    numbers below refer to this manuscript. 
 """
 from .monochromatic_simulator import MonochromaticField
 from .propagation_methods.coherent_response import DeferredPropagation
@@ -11,33 +21,45 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 class IncoherentLightSimulation:
-    """
-    Simulate diffraction from a spatially incoherent source at one wavelength.
+    """Predict the light reaching a detector at one wavelength from extended
+    incoherent sources.
 
-    Configure the source radiance, then supply a callback that adds the optics
-    and performs the propagation. The source contributions are combined by
-    intensity convolution, using the selected NumPy, CuPy or JAX backend.
+    Start by describing the source. Use set_illumination_from_plane for
+    emitters at known positions and distance, or set_angular_illumination
+    when you know the distribution of incoming directions.
+
+    Next describe the optics. The pupil / far_field_model / finite_distance_model 
+    specifies how the aperture changes the amplitude and phase of the light across its opening. 
+    Pass a function that applies your optics to get_irradiance for a detector at a known
+    distance, or to get_farfield for the power sent in each direction.
+
+    Lengths are in micrometres. Use constants such as nm and mm when a
+    different unit is more natural. Supply source radiance in W m⁻² sr⁻¹.
+    Monitor irradiance is returned in W/m². Section 3.7 of [1] connects
+    these two stages of a simulation to the propagation equations. Select
+    the NumPy, CuPy or JAX backend before creating the simulation.
     """
 
     def __init__(self, λ, extent_x, extent_y, Nx, Ny):
-        """
-        Initialize the rectangular grid on which the pupil is sampled.
+        """Set the wavelength and the grid on which the pupil is sampled.
 
         Parameters
         ----------
-        λ: wavelength of the light, in micrometres.
-        extent_x: width of the pupil grid, in micrometres.
-        extent_y: height of the pupil grid, in micrometres.
-        Nx: number of horizontal pupil samples.
-        Ny: number of vertical pupil samples.
+        λ : float
+            Wavelength in micrometres, for example 940*nm.
+        extent_x, extent_y : float
+            Width and height of the pupil grid in micrometres.
+        Nx, Ny : int
+            Number of pupil samples along x and y.
 
         Notes
         -----
-        The callback defines the monitor grid independently of the pupil grid.
-        For nonparaxial calculations, x_screen and y_screen can override its
-        monitor coordinates; see get_irradiance.
+        Choose the pupil spacing fine enough to describe the features in your
+        optics. The detector can have a different size and spacing. For example,
+        zoom_propagate in the optical callback chooses the part of the detector
+        you want to see. See get_irradiance for other choices of monitor points.
         """
-        # Resolve the selected backend when constructed, after set_backend(...).
+        # Use the array library selected before this simulation was created.
         global bd, backend_name, map_coordinates, jax
         from .util.backend_functions import backend as bd, backend_name
         if backend_name == "jax":
@@ -48,7 +70,7 @@ class IncoherentLightSimulation:
         else:
             from scipy.ndimage import map_coordinates
 
-        # Coordinates where the pupil transmission is sampled.
+        # The pupil is sampled on a grid with the optical axis at x = y = 0.
         self.λ = λ
         self.Nx, self.Ny = Nx, Ny
         self.extent_x, self.extent_y = extent_x, extent_y
@@ -59,34 +81,44 @@ class IncoherentLightSimulation:
         self.y = self.dy * (bd.arange(Ny) - Ny // 2)
         self.xx, self.yy = bd.meshgrid(self.x, self.y)
 
-        # The source is configured separately from propagation.
-        self._source_plane_illumination = None  # Original plane source for plotting.
+        # Keep the original plane source so it can also be plotted in length units.
+        self._source_plane_illumination = None
         self.plane_illumination = None
         self.angular_illumination = None
-        self.z1 = bd.inf  # ∞ means angular specification
+        self.z1 = bd.inf  # An angular source supplies plane waves.
         self.paraxial = True
 
-        # Optional detector coordinates; None uses the callback's monitor.
+        # By default the optical callback chooses the detector coordinates.
         self.x_screen = self.y_screen = None
 
-        # A propagation call stores the source coherence for plotting.
-        self._last_gamma = None  # mutual coherence magnitude for plotting
+        # A full-grid calculation saves the magnitude of the incident coherence for plotting.
+        self._last_gamma = None
 
     def set_pupil_quadrature(self, radius, order=2):
-        """
-        Resolve phase pixels and the boundary of a circular pupil by quadrature.
+        """Sample the transmission at several points inside each pupil pixel.
 
         Parameters
         ----------
-        radius: radius of the circular pupil, in micrometres; it must fit in the grid.
-        order: number of Gauss integration points per axis within each pixel.
+        radius : float
+            Radius of the circular pupil in micrometres. The circle must fit
+            inside the grid.
+        order : int
+            Number of Gauss integration points along each axis of a pixel.
 
         Notes
         -----
-        Call before sampling the aperture: this replaces x, y, xx, yy, Nx and Ny
-        with the quadrature grid. The original pixels retain their physical size.
-        Finite-distance propagation uses sampling="angular" with ASM or Fresnel.
-        The quadrature geometry is fixed; pupil values remain differentiable.
+        A pixel whose centre lies outside the circle may still have a corner
+        inside it. The integration weights account for the part of the pixel
+        that transmits light. This is useful when the boundary or the phase within a pixel
+        matters to the diffracted field.
+
+        Call this method before building the aperture. It updates x, y, xx, yy,
+        Nx and Ny to describe the integration points. The physical pixels keep
+        their original size. For a finite monitor, use angular sampling with
+        model="ASM" or model="Fresnel". With the geometry fixed, you can
+        differentiate the result with respect to the sampled pupil values.
+        Supplement 1, Section S4.1, explains how refining the pupil sampling
+        helps distinguish numerical error from a propagation approximation.
         """
         from diffractsim.util.pupil_quadrature import PupilQuadrature
         previous = getattr(self, "pupil_quadrature", None)
@@ -97,39 +129,54 @@ class IncoherentLightSimulation:
         self.Nx, self.Ny = len(self.x), len(self.y)
         self.xx, self.yy = bd.meshgrid(self.x, self.y)
 
-    # --------------------- illumination ---------------------
+    # Illumination
 
     def set_illumination_from_plane(self, illum_func, distance, paraxial=True,
                                     angular_samples=1024, angular_limit=2.0,
                                     source_subpixels=1, source_bounds=None):
-        """
-        Set source-plane radiance and map it to incident directions.
+        """Describe the emitting plane by its radiance and its distance from the pupil.
 
         Parameters
         ----------
-        illum_func: function illum_func(x, y) returning radiance in W m^-2 sr^-1;
-            x and y are source-plane coordinates in micrometres, supplied as arrays.
-        distance: positive source-to-pupil distance, in micrometres.
-        paraxial: use small-angle geometry if True; direction cosines if False.
-        angular_samples: number of samples per axis of the finite-distance
-            angular convolution grid; integer >= 8.
-        angular_limit: half-width of that grid in direction-cosine coordinates.
-        source_subpixels: samples per axis within each angular source cell;
-            1 samples directly, larger values average the source within the cell.
-        source_bounds: optional (alpha_min, alpha_max, beta_min, beta_max)
-            enclosing the source in angular coordinates, not lengths.
+        illum_func : callable
+            illum_func(x, y) gives the radiance in W m⁻² sr⁻¹. It receives
+            arrays of source positions in micrometres.
+        distance : float
+            Positive distance from the source plane to the pupil in micrometres.
+        paraxial : bool
+            True uses the small-angle mapping. False uses the actual directions
+            from the pupil centre to the source.
+        angular_samples : int
+            Samples per axis of the wide-angle convolution grid. Use at least 8.
+        angular_limit : float
+            Half-width of that grid in direction-cosine coordinates.
+        source_subpixels : int
+            Number of source samples per angular cell along each axis. Values
+            above 1 help resolve a sharp source edge in the wide-angle calculation.
+        source_bounds : tuple, optional
+            (alpha_min, alpha_max, beta_min, beta_max) enclosing all nonzero
+            radiance in angular coordinates. See set_angular_illumination.
 
         Notes
         -----
-        The distance also supplies the common incident quadratic phase.
-        The source must be zero outside source_bounds when bounds are supplied.
-        See set_angular_illumination for grid extent and compact-monitor rules.
+        The simulation needs the brightness arriving from each direction.
+        Starting at the pupil centre, it follows that direction back to the
+        emitting plane and reads the radiance there. The direction cosines
+        (alpha, beta, c) are the components of a unit vector pointing from the
+        pupil to the source. With c = sqrt(1 - alpha² - beta²), the source
+        point is (distance*alpha/c, distance*beta/c). At small angles the
+        paraxial model takes c as 1. Equations (14)–(15) give the geometry.
+
+        A nearby point also sends a curved wavefront to the pupil. To reuse one
+        diffraction pattern, the fast model uses the on-axis quadratic phase
+        to approximate the curvature for every point at this distance. Section 3.5 of [1]
+        explains the approximation. get_irradiance_rs can check it.
         """
         traced_distance = backend_name == "jax" and isinstance(distance, jax.core.Tracer)
         if not traced_distance and (not np.isfinite(distance) or distance <= 0):
             raise ValueError("Source distance must be finite and positive.")
         def angular_from_plane(alpha, beta):
-            """Evaluate the plane-source radiance along each incident direction."""
+            """Look up the emitting point seen from the pupil in this direction."""
             c = 1 if paraxial else bd.sqrt(bd.maximum(1-alpha**2-beta**2, 1e-15))
             radiance = illum_func(distance*alpha/c, distance*beta/c)
             return radiance if paraxial else bd.where(alpha**2+beta**2 < 1, radiance, 0)
@@ -144,34 +191,48 @@ class IncoherentLightSimulation:
     def set_angular_illumination(self, illum_func, paraxial=False,
                                  angular_samples=1024, angular_limit=2.0,
                                  source_subpixels=1, source_bounds=None):
-        """
-        Set source radiance as a function of incident direction cosines.
+        """Describe the source by its radiance in each direction as seen from the pupil.
 
         Parameters
         ----------
-        illum_func: function illum_func(alpha, beta) returning radiance in
-            W m^-2 sr^-1; it must accept broadcastable coordinate arrays.
-        paraxial: use the paraxial convolution if True; the nonparaxial model
-            if False. This does not select the callback's coherent propagator.
-        angular_samples: samples per axis of the nonparaxial finite-distance
-            convolution grid; integer >= 8, default 1024.
-        angular_limit: half-width of that grid; default 2 covers all sums of
-            physical source and output direction cosines for general pupils.
-        source_subpixels: positive number of samples per axis within a source
-            cell; use values > 1 to resolve source edges by averaging.
-        source_bounds: optional (alpha_min, alpha_max, beta_min, beta_max)
-            outside which the radiance is zero; enables compact convolutions
-            for fixed angular-Fresnel or FFT rectangular monitors, paired regions,
-            and large-pupil angular ASM zooms that exceed the global-grid threshold.
+        illum_func : callable
+            illum_func(alpha, beta) gives radiance in W m⁻² sr⁻¹ and accepts
+            broadcastable arrays. The coordinates point from the pupil towards
+            the emitter. For example, (0, 0) is a source on the optical axis.
+        paraxial : bool
+            True shifts the reference pattern on a flat detector using the
+            small-angle approximation. False uses direction cosines. The
+            optical callback chooses how the coherent field propagates.
+        angular_samples : int
+            Samples per axis of the wide-angle grid for a finite monitor.
+            The default is 1024 and the minimum is 8.
+        angular_limit : float
+            Half-width of that grid. With regular full-grid angular sampling,
+            use at least 2 to include all source and detector direction sums.
+        source_subpixels : int
+            Samples of source radiance per cell along each axis. A value of 1
+            gives one sample. Increase it to resolve a narrow emitter or an
+            edge without refining the entire coherent response.
+        source_bounds : tuple, optional
+            (alpha_min, alpha_max, beta_min, beta_max) outside which the
+            radiance is zero. With fixed geometry these bounds can reduce
+            the region needed for the convolution. See get_irradiance.
 
         Notes
         -----
-        This setter removes any source-plane curvature. General full-grid
-        angular responses require angular_limit >= 2. PeriodicGaussianPupil
-        instead requires a grid covering its selected diffraction orders.
-        Compact convolutions require fixed source bounds and monitor geometry;
-        source and pupil values remain differentiable. get_farfield uses the
-        grid supplied by its callback, rather than these sampling settings.
+        Use this description for a mixture of plane waves, for example after
+        collimating an emitter array. Each direction illuminates the pupil
+        with a plane wave. Switching from a source plane to this description
+        thus removes the incident curvature. The source coordinates look towards
+        the emitter, so an emitter at positive x sends light towards negative x.
+        This explains the reversed source coordinates in Eq. (18).
+
+        Directions in the forward hemisphere satisfy alpha² + beta² < 1. An
+        incident and an outgoing direction can each lie inside this disk while
+        their sum lies outside it. The coherent response must cover these sums.
+        For a PeriodicGaussianPupil, cover the selected diffraction orders and
+        choose a grid step that divides wavelength/period so each order falls
+        on a sample. For get_farfield the callback supplies the grid directly.
         """
         if not isinstance(angular_samples, (int, np.integer)) or angular_samples < 8:
             raise ValueError("angular_samples must be an integer >= 8.")
@@ -194,18 +255,25 @@ class IncoherentLightSimulation:
         self.source_bounds = source_bounds
 
     def get_incident_irradiance(self):
-        """
-        Integrate the configured angular radiance over its compact support.
+        """Return the irradiance incident on the pupil before it transmits any light.
 
         Returns
         -------
-        irradiance: scalar incident pupil irradiance, in W/m².
+        irradiance : scalar
+            Incident irradiance at the pupil centre in W/m².
 
         Notes
         -----
-        Configure illumination with source_bounds first. The integral uses
-        source_subpixels and the angular grid step; multiplying by pupil area
-        gives the incident power used to normalize collection efficiency.
+        Set source_bounds to enclose the emitting directions. The integral adds
+        the radiance in each cell times its area in direction-cosine coordinates.
+        This area already includes the cosine that projects the incoming light
+        onto the pupil plane. The angular grid spacing and source_subpixels
+        control how finely the integral samples the source.
+
+        The result is the zero-separation value of the coherence function in
+        Eq. (16). For uniform illumination across a pupil, multiplying by its
+        area in square metres gives the incident power in watts. This provides a
+        reference for the fraction of power collected on a detector.
         """
         if self.angular_illumination is None:
             raise ValueError("Configure illumination first.")
@@ -216,56 +284,73 @@ class IncoherentLightSimulation:
             2*self.angular_limit/self.angular_samples, self.source_subpixels)
         return bd.sum(mass)
 
-    # --------------------- core computations ---------------------
+    # Propagation
 
     def get_irradiance_rs(self, finite_distance_model, z, *, source_order=3,
                           monitor_order=7, angular_samples=None, source_bounds=None,
                           Nx_mon=None, Ny_mon=None):
-        """
-        Check a single-pupil simulation with the paper's full RS integral.
+        """Check a finite-monitor prediction with the Rayleigh–Sommerfeld (RS) integral.
 
         Parameters
         ----------
-        finite_distance_model: the same callback used by get_irradiance. It
-            applies the pupil and ends with a free-space propagation by z.
-            Its final model and sampling select no approximation here: the
-            reference always evaluates the full Rayleigh-Sommerfeld kernel.
-        z: positive pupil-to-monitor distance, in micrometres.
-        source_order: interpolation nodes per source-slope axis, default 3.
-            Used only for a source at finite distance.
-        monitor_order: interpolation nodes per monitor-slope axis, default 7.
-        angular_samples: optional angular resolution for this reference;
-            None uses the configured source grid spacing. It does not change
-            the simulator or the number of returned monitor samples.
-        source_bounds: optional (alpha_min, alpha_max, beta_min, beta_max).
-            None uses the configured bounds, or finds the nonzero source cells.
-            For a finite source, this rectangle must fit inside the unit disk.
-        Nx_mon, Ny_mon: optional monitor counts for a zoom callback. None
-            retains its counts. Smaller counts can make an image check cheaper.
+        finite_distance_model : callable
+            Use the same function as for get_irradiance. It supplies a single
+            sampled pupil and ends with free-space propagation by z. The last
+            step defines the monitor. The reference evaluates the RS kernel
+            for either choice of coherent propagation model.
+        z : float
+            Fixed positive distance from the pupil to the monitor in micrometres.
+        source_order, monitor_order : int
+            Number of interpolation nodes per axis in source and monitor slope,
+            respectively. A slope is a transverse displacement divided by the
+            axial distance. Both orders must be at least 2. The defaults are
+            3 and 7. Only a source plane needs the source interpolation.
+        angular_samples : int, optional
+            Angular resolution for this check. The default uses the configured
+            spacing. Increasing it refines the angular integral while the number
+            of returned monitor points stays the same.
+        source_bounds : tuple, optional
+            (alpha_min, alpha_max, beta_min, beta_max) enclosing the source.
+            By default the reference uses the configured bounds or finds the
+            nonzero source cells. For a finite source plane, all four corners
+            of the rectangle must lie inside alpha² + beta² < 1.
+        Nx_mon, Ny_mon : int, optional
+            Override the sample counts of a zoom monitor when x_screen and
+            y_screen are unset. Fewer points can make an initial check cheaper.
 
         Returns
         -------
-        x, y, E: monitor coordinates in micrometres and irradiance in W/m²,
-            with the same axis and array conventions as get_irradiance.
+        x, y, E : arrays
+            Monitor coordinates in micrometres and irradiance in W/m². The
+            coordinate and shape conventions are the same as in get_irradiance.
 
         Notes
         -----
-        For a plane source, Eq. (25) retains each emitter's spherical incident
-        field and the outgoing RS kernel. An angular source supplies plane
-        waves instead. Intensities add with the configured radiance; the
-        paraxial flag and Eq. (24)'s common curvature are not used.
+        For a point on a source plane, Eq. (25) follows the spherical wave from
+        the emitter across the pupil and then from the pupil to the detector.
+        An angular source supplies a plane wave for the first leg. For each
+        emitter, first add the complex fields from across the pupil. The squared
+        magnitude of that sum gives its diffraction pattern. Then add the emitter
+        patterns, weighting each by its radiance. This tests the detector
+        remapping in Eq. (24) and, for a finite source plane, the shared incident
+        curvature as well. The reference uses the true directions even when the
+        fast calculation was set to paraxial.
 
-        As in the paper's whole-image reference, interpolation of the smooth
-        kernel factors avoids propagating thousands of emitters separately.
-        Both kernels are evaluated in full at the interpolation nodes.
-        Increase source_order, monitor_order and angular_samples separately
-        to check numerical convergence. source_subpixels still resolves edges
-        of the source; the existing pupil grid supplies the pupil quadrature.
+        Evaluating this integral separately at every source and monitor point
+        would be expensive. After accounting for the wavefront tilt, the
+        remaining factors vary smoothly with direction. The code evaluates the
+        full kernels at selected directions and interpolates the resulting
+        intensity response between them. Increase source_order, monitor_order
+        and angular_samples one at a time to check convergence. Source edges
+        also depend on source_subpixels, and the pupil needs sufficient samples
+        to resolve its transmission. Supplement 1, Sections S3.1 and S5.3, of [1]
+        give the reference integral and an example of these checks.
 
-        This reference supports one sampled pupil followed by free space.
-        Geometry and orders must be fixed. Phase gradients are supported;
-        pass fixed source_bounds to differentiate source parameters under JIT.
-        No pupil values or source values are cached between calls.
+        Keep the geometry and interpolation orders fixed. To differentiate
+        source radiance with JAX, supply fixed source_bounds. Gradients with
+        respect to the sampled pupil phase are also supported. For a periodic
+        Gaussian pupil, sample the repeated transmission across the illuminated
+        pupil, including its Gaussian envelope.
         """
         from .propagation_methods.rayleigh_sommerfeld import rayleigh_sommerfeld_irradiance
         if self.angular_illumination is None:
@@ -313,6 +398,8 @@ class IncoherentLightSimulation:
             raise ValueError("Monitor coordinates must be finite and nonempty.")
 
         illumination = self.angular_illumination
+        # The reference traces the true direction back to the source plane,
+        # including when the fast calculation used small angles.
         if self.plane_illumination is not None:
             if not np.isscalar(self.z1) or not np.isfinite(self.z1):
                 raise ValueError("The RS reference requires a fixed source distance.")
@@ -329,45 +416,65 @@ class IncoherentLightSimulation:
         return bd.asarray(x), bd.asarray(y), E
 
     def get_irradiance(self, finite_distance_model, z):
-        """
-        Compute irradiance on a finite monitor for the configured source.
+        """Compute the irradiance on a flat detector at a finite distance.
 
         Parameters
         ----------
-        finite_distance_model: callback finite_distance_model(F, z) that adds
-            optical elements, propagates and returns F. Use F = F.add(...)
-            and F = F.zoom_propagate(...), or another supported propagation
-            method. In the nonparaxial case, the final step must propagate by z.
-        z: positive distance from the final pupil to the monitor, in micrometres.
+        finite_distance_model : callable
+            A function finite_distance_model(F, z) that adds the optics and
+            returns the propagated field. Assign the field returned by each
+            step, for example F = F.add(aperture). For the wide-angle model,
+            finish with F.propagate(z) or F.zoom_propagate(z, ...).
+        z : float
+            Positive distance from the final pupil to the detector in micrometres.
 
         Returns
         -------
-        x: horizontal monitor coordinates, in micrometres.
-        y: vertical monitor coordinates, in micrometres.
-        E: irradiance in W/m²; shape (len(y), len(x)) for one-dimensional axes,
-            or the broadcast shape of paired coordinate arrays.
+        x, y, E : arrays
+            Detector coordinates in micrometres and irradiance in W/m². For
+            one-dimensional axes, E[j, i] is the irradiance at (x[i], y[j]).
+            With paired coordinates, E has their broadcast shape.
 
         Notes
         -----
-        The illumination's paraxial setting selects Eq. (8) or Eq. (24).
-        Your callback chooses the coherent propagation model and monitor.
-        For nonparaxial zooms, sampling="angular" evaluates the response at
-        direction cosines; sampling="fft" uses the coherent monitor intensity.
+        At small angles, moving an emitter sideways shifts its diffraction
+        pattern across the detector. Eq. (8) adds these shifted patterns with
+        weights set by the source radiance.
 
-        With source_bounds and fixed geometry, angular Fresnel and FFT zooms
-        evaluate only the region needed by the source convolution. Angular
-        ASM does this for ordinary unpropagated pupils when the estimated
-        full spectrum exceeds 8192 samples per axis. It evaluates that region
-        in blocks; the region including source shifts must lie inside the
-        propagating disk. FFT zooms extend the coherent monitor at its original
-        spacing when all required directions lie inside that disk.
+        At wide angles, equal changes in direction correspond to larger
+        distances near the edge of a flat detector than near its centre.
+        Eq. (24) therefore expresses the reference pattern as power per unit
+        area in direction-cosine coordinates. It shifts and adds the patterns
+        there, then converts the sum back to power per unit detector area.
+        Section 3.6 of [1] and Supplement 1, Section S2.7, explain the
+        finite-distance approximation. Use get_irradiance_rs to check it.
 
-        To override the nonparaxial monitor, set both x_screen and y_screen.
-        One-dimensional arrays give rectangular axes; paired arrays give
-        individual points. With source_bounds, each row of paired coordinates
-        is a separate region and must remain fixed. Omit bounds to differentiate
-        those coordinates. Phase gradients remain supported with fixed geometry.
-        PeriodicGaussianPupil uses its own response and requires monitor axes.
+        The source's paraxial setting selects the rule for adding intensities.
+        The callback selects the coherent propagation and the monitor. The
+        angular-spectrum method ("ASM") retains the full propagation phase,
+        while "Fresnel" uses a paraxial approximation. For a wide-angle zoom,
+        sampling="angular" evaluates the response at the required directions.
+        With sampling="fft", the code propagates onto a rectangular grid and
+        reads the intensity at the corresponding points.
+
+        To choose different monitor points for the wide-angle calculation, set
+        both x_screen and y_screen. Two one-dimensional arrays give all
+        combinations of x and y. Two-dimensional arrays specify pairs of
+        coordinates. With source_bounds, each row of pairs defines a region
+        that can be evaluated separately. Keep these regions fixed when using
+        JAX. Omit source_bounds to differentiate monitor coordinates on the
+        full grid.
+
+        If the source has known bounds and the monitor is fixed, a Fresnel
+        angular zoom or an FFT zoom needs only the directions that contribute
+        to the requested region. When all these directions lie inside the unit
+        disk, an FFT zoom can extend the coherent grid at its original spacing.
+        An angular-spectrum zoom of a regular, unpropagated pupil also uses
+        smaller regions when its full spectrum would exceed 8192 samples per
+        axis. This last calculation works in blocks and needs the region,
+        including the source shifts, to fit inside the disk. These choices
+        allow gradients with respect to the pupil values. PeriodicGaussianPupil
+        uses its diffraction orders and requires a pair of monitor axes.
         """
         traced_distance = backend_name == "jax" and isinstance(z, jax.core.Tracer)
         if not traced_distance and (not np.isfinite(z) or z <= 0):
@@ -379,25 +486,28 @@ class IncoherentLightSimulation:
         if hasattr(self, "pupil_quadrature"):
             F.pupil_quadrature = self.pupil_quadrature
             F.x, F.y, F.xx, F.yy = self.x, self.y, self.xx, self.yy
-        # Add the common curvature of a source at finite distance.
+        # Give the reference wave the curvature of the on-axis emitter (Eq. 22).
         if self.plane_illumination is not None:
             F.E = F.E * bd.exp(1j*bd.pi*(F.xx**2+F.yy**2)/(self.λ*self.z1))
-        # Record the final step so Eq. (24) samples it only where it is needed.
+        # Delay the final propagation until the required monitor directions are known.
         if not self.paraxial:
             F = DeferredPropagation(F)
         F = finite_distance_model(F, z)
 
         if self.paraxial:
-            # Eq. (8): source directions translate the coherent screen image.
+            # A source point seen to the right moves its pattern to the left.
+            # Eq. (8) therefore uses the source at (-x/z, -y/z).
             x, y = F.x, F.y
             xx, yy = bd.meshgrid(x, y)
             J = self.angular_illumination(-xx/z, -yy/z)
             H = bd.abs(F.E)**2
+            # Leave room beyond the detector edges for the shifted patterns.
             shape = (2*len(y), 2*len(x))
             C = bd.fft.irfft2(bd.fft.rfft2(J, s=shape)*bd.fft.rfft2(H, s=shape), s=shape)
-            # Align the summed origins; fractional offsets blend neighboring crops.
+            # The first sample of a convolution is at the sum of the two origins.
+            # Read it back on the detector axes, interpolating between samples if needed.
             E = crop_convolution(C, x, y)
-            # Plotting data are cached only in ordinary, untraced evaluations.
+            # Save concrete values for plotting after a forward calculation.
             if backend_name != "jax" or not isinstance(E, jax.core.Tracer):
                 self.z = z
                 self._last_gamma = bd.abs(bd.fft.fftshift(bd.fft.ifft2(bd.fft.ifftshift(J))))*J.size*(x[1]-x[0])*(y[1]-y[0])/z**2
@@ -413,9 +523,8 @@ class IncoherentLightSimulation:
             raise ValueError("The model's final propagation distance must equal z.")
         if (self.x_screen is None) != (self.y_screen is None):
             raise ValueError("Set both x_screen and y_screen, or leave both as None.")
-        # A large sampled pupil can make the global ASM spectrum impractical.
-        # Only this previously unbounded case selects the tiled quadrature;
-        # existing small-pupil and explicitly paired-region paths are retained.
+        # A wide pupil needs fine angular sampling. If a full spectrum would be
+        # too large, compute only the regions that can illuminate this detector.
         large_angular_asm = False
         if (F.model == "ASM" and F.sampling == "angular" and
                 F.method == "zoom_propagate" and self.source_bounds is not None and
@@ -426,7 +535,8 @@ class IncoherentLightSimulation:
                 factor = max(2, int(np.ceil(8*self.angular_limit*max(geometry[:2])/
                                            (geometry[2]*self.angular_samples))))
                 large_angular_asm = factor*self.angular_samples > 8192
-        # Keep fixed zoom geometry on the host, even while JAX traces the pupil.
+        # With fixed geometry we can choose the required directions once,
+        # even when JAX is differentiating the pupil values.
         automatic_compact = not traced_step and (
             F.model == "Fresnel" and F.sampling == "angular" or
             F.sampling == "fft" and F.method == "zoom_propagate" or large_angular_asm)
@@ -439,7 +549,8 @@ class IncoherentLightSimulation:
                               else (self.x_screen, self.y_screen))
 
         if hasattr(F.pupil, "periodic_gaussian_pupil"):
-            # Evaluate the selected Gaussian-order response for the VCSEL pupil.
+            # Combine the source with the broadened diffraction orders of the
+            # Gaussian pupil, then project that angular pattern onto the detector.
             if F.model not in ("ASM", "Fresnel") or F.sampling != "angular":
                 raise ValueError('PeriodicGaussianPupil requires model="ASM" or "Fresnel" '
                                  'with sampling="angular".')
@@ -465,8 +576,8 @@ class IncoherentLightSimulation:
                 self._coherence_y = self._coherence_x
             return x, y, E
 
-        # A rectangle is one compact region; explicit paired rows retain their
-        # existing grouping. The public result keeps the requested monitor shape.
+        # A rectangular detector is one region. For separate groups of detector
+        # points, each row of coordinate pairs describes one region.
         rectangular = np.ndim(x_screen) == np.ndim(y_screen) == 1
         paired_rows = np.ndim(x_screen) == np.ndim(y_screen) == 2
         traced_geometry = traced_distance
@@ -497,12 +608,14 @@ class IncoherentLightSimulation:
 
         source_subpixels = self.source_subpixels
         x, y = bd.asarray(x_screen), bd.asarray(y_screen)
-        # K is the coherent response expressed in direction-cosine coordinates.
+        # Express the reference pattern on an angular grid so every source
+        # direction can shift a copy of the same array.
         a, K = F.angular_propagate(z, self.angular_samples, self.angular_limit)
         da = a[1]-a[0]
         aa, bb = bd.meshgrid(a, a)
 
-        # Evaluate L_in(-a,-b) once, or average within each angular cell.
+        # Reverse the source axes because they point towards the emitters.
+        # Sampling within a cell helps resolve an edge that crosses it.
         if source_subpixels == 1:
             J = bd.where(aa*aa+bb*bb < 1, self.angular_illumination(-aa, -bb), 0)
         else:
@@ -515,7 +628,9 @@ class IncoherentLightSimulation:
                     value = self.angular_illumination(u, v)
                     J = J+bd.where(valid, value, 0)/source_subpixels**2
 
-        # Zero-padded linear convolution: no periodic images from FFT wraparound.
+        # The FFT treats a grid as if it repeats. Pad both arrays with zeros
+        # so light shifted past one edge does not reappear at the opposite edge.
+        # Each source cell contributes its radiance times its angular area, da².
         shape = (2*len(a),)*2
         S = bd.fft.irfft2(bd.fft.rfft2(J, s=shape)*bd.fft.rfft2(K, s=shape), s=shape)*da**2
         xx, yy = (bd.meshgrid(x, y) if x.ndim == y.ndim == 1
@@ -524,7 +639,8 @@ class IncoherentLightSimulation:
         alpha, beta = xx/rho, yy/rho
         S = map_coordinates(S, bd.array([(beta-2*a[0])/da, (alpha-2*a[0])/da]),
                             order=1, mode="constant", cval=0)
-        # Convert the angular result to irradiance on the flat monitor.
+        # A fixed detector area spans less of the angular grid towards the edges.
+        # The factor z²/rho⁴ converts power on that grid to power per detector area.
         E = z*z/rho**4*S
         if backend_name != "jax" or not isinstance(E, jax.core.Tracer):
             self.z = z
@@ -536,28 +652,39 @@ class IncoherentLightSimulation:
         return x, y, bd.maximum(E, 0)
 
     def get_farfield(self, far_field_model):
-        """
-        Compute the angular far field for the configured incoherent source.
+        """Find how the power leaving the pupil is distributed over outgoing directions.
 
         Parameters
         ----------
-        far_field_model: callback far_field_model(F) that adds the optics and
-            returns F.get_farfield(...), including its two angular axes.
+        far_field_model : callable
+            A function far_field_model(F) that adds the optics and returns
+            F.get_farfield(...). Its two uniformly spaced angular axes set the
+            sampling for both the source and the coherent response.
 
         Returns
         -------
-        alpha: one-dimensional horizontal direction-cosine axis.
-        beta: one-dimensional vertical direction-cosine axis.
-        S: radiant intensity divided by cos(theta), in picowatts/sr, with shape
-            (len(beta), len(alpha)); zero outside alpha² + beta² < 1.
+        alpha, beta, S : arrays
+            Horizontal and vertical direction-cosine axes and an angular power
+            distribution of shape (len(beta), len(alpha)). In diffractsim's
+            power units, S is (dP/dΩ)/cos(theta) in picowatts per steradian.
+            S is zero outside the forward disk alpha² + beta² < 1.
 
         Notes
         -----
-        The callback grid must cover sums of output and source directions;
-        [-2, 2] on each axis covers all physical pairs. Keep the full coherent
-        spectrum until source contributions have been combined. Convert S to
-        radiant intensity with to_radiant_intensity(alpha, beta, S), then divide
-        by W for W/sr. plot_farfield converts its input to W/sr for display.
+        Each incident plane wave shifts the same coherent far-field pattern.
+        For output (alpha, beta) and a source seen at (u, v), the required
+        value of that pattern is at (alpha + u, beta + v). Choose callback
+        axes that cover these sums as well as the emitting directions.
+        An interval from -2 to 2 on each axis covers every physical pair.
+        Keep the coherent response over the full interval until after adding
+        the source contributions.
+
+        For a prescribed mixture of plane waves, this is Eq. (18) within the
+        scalar power convention of [1, 3]. For a source on a finite plane,
+        Eq. (22) includes the common incident curvature. As Eq. (13) shows,
+        integrating S over d(alpha) d(beta) gives power.
+        For power per solid angle, use to_radiant_intensity(alpha, beta, S)
+        and divide the result by W to express it in watts per steradian.
         """
         if self.angular_illumination is None:
             raise ValueError("Configure illumination before propagation.")
@@ -566,12 +693,13 @@ class IncoherentLightSimulation:
         if hasattr(self, "pupil_quadrature"):
             F.pupil_quadrature = self.pupil_quadrature
             F.x, F.y, F.xx, F.yy = self.x, self.y, self.xx, self.yy
-        # Add the common curvature of a source at finite distance.
+        # Give the reference wave the curvature of the on-axis emitter (Eq. 22).
         if self.plane_illumination is not None:
             F.E = F.E*bd.exp(1j*bd.pi*(F.xx**2+F.yy**2)/(self.λ*self.z1))
         a, b, H = far_field_model(F)
         aa, bb = bd.meshgrid(a, b)
-        # Reverse the source coordinates to write the angular sum as a convolution.
+        # Eq. (18) needs the pupil response at outgoing plus source direction.
+        # Reversing the source axes gives that sum in an ordinary convolution.
         J = self.angular_illumination(-aa, -bb)
         J = bd.where(aa*aa+bb*bb < 1, J, 0)
         da, db = a[1]-a[0], b[1]-b[0]
@@ -584,24 +712,33 @@ class IncoherentLightSimulation:
             self._coherence_y = self.λ*bd.fft.fftshift(bd.fft.fftfreq(len(b), d=db))
         return a, b, bd.where(aa*aa+bb*bb < 1, bd.maximum(S, 0), 0)
 
-    # --------------------- visualization helpers ---------------------
+    # Plotting and unit conversion
 
     @staticmethod
     def to_radiant_intensity(alpha, beta, S):
-        """
-        Convert the angular output S to radiant intensity dP/dΩ.
+        """Convert the far-field distribution to radiant intensity (power per solid angle).
 
         Parameters
         ----------
-        alpha: one-dimensional horizontal direction-cosine axis.
-        beta: one-dimensional vertical direction-cosine axis.
-        S: output of get_farfield, with shape (len(beta), len(alpha)).
+        alpha, beta : one-dimensional arrays
+            Horizontal and vertical direction cosines returned by get_farfield.
+        S : array
+            Angular distribution returned by get_farfield, with shape
+            (len(beta), len(alpha)).
 
         Returns
         -------
-        intensity: S * sqrt(1 - alpha² - beta²), in the same units as S.
-            Divide by W for W/sr when S comes from get_farfield. Values
-            outside the propagating disk are zero. JAX gradients are retained.
+        intensity : array
+            Radiant intensity dP/dΩ on the same grid. Divide by W to express
+            the result in watts per steradian when S comes from get_farfield.
+
+        Notes
+        -----
+        A patch of solid angle dΩ has projected area cos(theta) dΩ on the
+        direction-cosine disk. This is why a distribution per unit area on
+        that disk must be multiplied by cos(theta) to give power per solid
+        angle. Here cos(theta) = sqrt(1 - alpha² - beta²). Points on or
+        outside the rim receive zero. See Eq. (13) and Section 3.1 of [1].
         """
         from .util.backend_functions import backend as bd
         alpha, beta = bd.asarray(alpha), bd.asarray(beta)
@@ -612,34 +749,47 @@ class IncoherentLightSimulation:
     def plot_map(x, y, values, *, ax=None, title="", labels=("x", "y"), colorbar_label="",
                     units=1, xlim=None, ylim=None, figsize=(5, 4),
                     cmap="inferno", vmin=None, vmax=None):
-        """
-        Plot a two-dimensional array with physical axes and a colorbar.
+        """Display a sampled quantity with its physical coordinates and a colorbar.
 
         Parameters
         ----------
-        x: ascending one-dimensional horizontal sample coordinates.
-        y: ascending one-dimensional vertical sample coordinates.
-        values: array of shape (len(y), len(x)), displayed without normalization.
-        ax: Matplotlib axes to draw on; None creates and shows a figure.
-        title: plot title.
-        labels: horizontal and vertical axis labels, including display units.
-        colorbar_label: label describing the supplied values and their units.
-        units: positive divisor for displayed coordinates; e.g. mm to display millimetres.
-        xlim: optional horizontal limits in the original coordinate units.
-        ylim: optional vertical limits in the original coordinate units.
-        figsize: figure width and height in inches, when ax is None.
-        cmap: Matplotlib colormap name or object.
-        vmin: lower color limit; None uses the data minimum.
-        vmax: upper color limit; None uses the data maximum.
+        x, y : one-dimensional arrays
+            Ascending horizontal and vertical sample positions.
+        values : array
+            Values on the grid. Row j and column i correspond to (x[i], y[j]).
+        ax : Matplotlib axes, optional
+            Axes to draw on. If omitted, create and show a figure.
+        title : str
+            Plot title.
+        labels : pair of strings
+            Horizontal and vertical axis labels, including the displayed units.
+        colorbar_label : str
+            Name and units of the plotted quantity.
+        units : float
+            Positive divisor for the displayed coordinates. For example, mm
+            displays positions supplied in micrometres on a millimetre scale.
+        xlim, ylim : pairs, optional
+            Visible intervals in the original coordinate units.
+        figsize : pair
+            Width and height in inches when creating a figure.
+        cmap : colormap or name
+            Matplotlib colormap.
+        vmin, vmax : floats, optional
+            Lower and upper limits of the color scale. By default the values
+            determine each unspecified limit.
 
         Returns
         -------
-        ax: Matplotlib axes containing the map.
+        ax : Matplotlib axes
+            Axes containing the map.
 
         Notes
         -----
-        Nonuniform coordinates are resampled only for display. Plotting copies
-        arrays to the CPU and should be called outside JAX transformations.
+        An image displays pixels at equal spacing. If the samples are unevenly
+        spaced, as they are for pupil quadrature, the plot uses the nearest
+        sample at each position on a uniform display grid. The simulation keeps
+        its original samples. Plot after a calculation, outside JAX tracing,
+        since Matplotlib needs the values on the CPU.
         """
         import numpy as np
         from .util.backend_functions import backend_name
@@ -652,7 +802,7 @@ class IncoherentLightSimulation:
         x, y, values = map(to_numpy, (x, y, values))
         if not (np.allclose(np.diff(x), x[1]-x[0], rtol=1e-6, atol=0) and
                 np.allclose(np.diff(y), y[1]-y[0], rtol=1e-6, atol=0)):
-            # Resample only for display; physical quadrature nodes are nonuniform.
+            # Each display pixel takes the value of the nearest physical sample.
             if xlim is not None:
                 lo, hi = max(0, np.searchsorted(x, xlim[0])-1), min(len(x), np.searchsorted(x, xlim[1])+1)
                 x, values = x[lo:hi], values[:, lo:hi]
@@ -684,31 +834,42 @@ class IncoherentLightSimulation:
     def plot_source_radiance(self, *, xlim=None, ylim=None, title=None,
                              angular=None, units=None, samples=256, ax=None,
                              figsize=(5, 4), cmap="inferno"):
-        """
-        Plot the source radiance on its original plane or in angular coordinates.
+        """Show where the source emits light or which directions it illuminates.
 
         Parameters
         ----------
-        xlim: horizontal limits in micrometres for a plane source, or direction cosines.
-        ylim: vertical limits in the same coordinate system as xlim.
-        title: plot title; None selects a title for the source coordinates.
-        angular: True for angular coordinates, False for source-plane coordinates;
-            None uses the original source plane when available.
-        units: coordinate display divisor; defaults to mm for a plane and 1 for angles.
-        samples: number of plotting samples per axis, at least 2; does not change
-            the propagation grid.
-        ax: Matplotlib axes; None creates and shows a figure.
-        figsize: figure width and height in inches, when ax is None.
-        cmap: Matplotlib colormap name or object.
+        xlim, ylim : pairs, optional
+            Visible intervals in micrometres on a source plane or in direction
+            cosines for an angular view.
+        title : str, optional
+            By default the title identifies the source coordinates.
+        angular : bool, optional
+            True selects the angular view. False selects the original source
+            plane. By default a source defined on a plane is shown on that plane.
+        units : float, optional
+            Divisor for the displayed coordinates. The defaults are mm for a
+            plane and 1 for direction cosines.
+        samples : int
+            Number of plotting samples along each axis, at least 2.
+        ax : Matplotlib axes, optional
+            Axes to draw on. If omitted, create and show a figure.
+        figsize : pair
+            Width and height in inches when creating a figure.
+        cmap : colormap or name
+            Matplotlib colormap.
 
         Returns
         -------
-        ax: Matplotlib axes with a radiance colorbar in W m^-2 sr^-1.
+        ax : Matplotlib axes
+            Source plot with radiance in W m⁻² sr⁻¹.
 
         Notes
         -----
-        Default limits span the pupil extents for a plane source and [-1, 1]
-        for angular coordinates. Set limits to cover the actual emitter array.
+        The plane view initially spans the pupil width and height. For an emitter
+        array wider than the pupil, set xlim and ylim to include the whole array.
+        The angular view looks out from the pupil and initially spans -1 to 1
+        on each axis. Both views sample the source function for the plot, so
+        you can adjust the plotted detail independently of the propagation.
         """
         plane_source = self._source_plane_illumination
         if angular is None:
@@ -746,30 +907,40 @@ class IncoherentLightSimulation:
 
     def plot_aperture(self, aperture, *, xlim=None, ylim=None, title=None,
                       units=mm, phase=False, ax=None, figsize=(5, 4), cmap=None):
-        """
-        Plot pupil amplitude transmission or wrapped phase.
+        """Show how the pupil transmits the amplitude or changes the phase of a field.
 
         Parameters
         ----------
-        aperture: optical element with get_transmittance, function (x, y, wavelength),
-            or complex transmission array broadcastable to (Ny, Nx).
-        xlim: optional horizontal limits, in micrometres.
-        ylim: optional vertical limits, in micrometres.
-        title: plot title; None selects an amplitude or phase title.
-        units: positive coordinate display divisor, default mm.
-        phase: True plots phase in [0, 2*pi); False plots amplitude |P|.
-        ax: Matplotlib axes; None creates and shows a figure.
-        figsize: figure width and height in inches, when ax is None.
-        cmap: Matplotlib colormap; None uses gray for amplitude and twilight for phase.
+        aperture : optical element, callable or array
+            Supply an element with get_transmittance, a function of (x, y,
+            wavelength), or complex transmission values that broadcast to (Ny, Nx).
+        xlim, ylim : pairs, optional
+            Visible intervals in micrometres.
+        title : str, optional
+            By default the title identifies the amplitude or phase view.
+        units : float
+            Positive divisor for the displayed coordinates. The default is mm.
+        phase : bool
+            False shows amplitude transmission |P|. True shows phase in radians,
+            wrapped into the interval from 0 up to 2π.
+        ax : Matplotlib axes, optional
+            Axes to draw on. If omitted, create and show a figure.
+        figsize : pair
+            Width and height in inches when creating a figure.
+        cmap : colormap or name, optional
+            The defaults are gray for amplitude and twilight for phase.
 
         Returns
         -------
-        ax: Matplotlib axes containing the pupil plot.
+        ax : Matplotlib axes
+            Axes containing the pupil plot.
 
         Notes
         -----
-        Zero-transmission regions have no displayed phase. A configured circular
-        pupil quadrature masks transmission outside its radius.
+        Where the pupil blocks the light, the transmitted field has no defined
+        phase, so that part of the phase plot is blank. If you set a circular
+        pupil with set_pupil_quadrature, the plot also masks the area outside
+        its radius.
         """
         if hasattr(aperture, "get_transmittance"):
             transmission = aperture.get_transmittance(self.xx, self.yy, self.λ)
@@ -800,20 +971,23 @@ class IncoherentLightSimulation:
                                 vmin=0, vmax=vmax)
 
     def plot_illumination_plane(self, extent_x=None, extent_y=None, figsize=(7, 6), **kwargs):
-        """
-        Plot the source in its original plane coordinates.
+        """Show the radiance at each position of the original emitting plane.
 
         Parameters
         ----------
-        extent_x: displayed width centred at zero, in micrometres; None uses default limits.
-        extent_y: displayed height centred at zero, in micrometres; None uses default limits.
-        figsize: figure width and height in inches.
-        **kwargs: plot_source_radiance options, such as title, units, samples and ax.
-            Explicit xlim and ylim override the corresponding extents.
+        extent_x, extent_y : floats, optional
+            Width and height in micrometres, centred on zero. By default the
+            view spans the pupil. Use xlim and ylim for an off-centre source.
+        figsize : pair
+            Figure width and height in inches.
+        **kwargs
+            Options for plot_source_radiance, such as units, samples, title and
+            ax. An explicit axis interval takes precedence over its extent.
 
         Returns
         -------
-        ax: Matplotlib axes containing the source radiance.
+        ax : Matplotlib axes
+            Source-plane plot with radiance in W m⁻² sr⁻¹.
         """
         if extent_x is not None:
             kwargs.setdefault("xlim", (-extent_x/2, extent_x/2))
@@ -823,20 +997,23 @@ class IncoherentLightSimulation:
 
     def plot_angular_illumination(self, source_extent_α=2.0, source_extent_β=2.0,
                                  figsize=(7, 6), **kwargs):
-        """
-        Plot source radiance versus incident direction cosines.
+        """Show the source radiance as seen in each direction from the pupil.
 
         Parameters
         ----------
-        source_extent_α: displayed horizontal angular width centred at zero.
-        source_extent_β: displayed vertical angular width centred at zero.
-        figsize: figure width and height in inches.
-        **kwargs: plot_source_radiance options, such as title, samples, cmap and ax.
-            Explicit xlim and ylim override the corresponding angular widths.
+        source_extent_α, source_extent_β : floats
+            Full horizontal and vertical widths in direction cosines, centred
+            on zero. The default width of 2 covers -1 to 1 on each axis.
+        figsize : pair
+            Figure width and height in inches.
+        **kwargs
+            Options for plot_source_radiance, such as samples, cmap, title and
+            ax. Use xlim or ylim to select a different interval on either axis.
 
         Returns
         -------
-        ax: Matplotlib axes containing the angular source radiance.
+        ax : Matplotlib axes
+            Angular source plot with radiance in W m⁻² sr⁻¹.
         """
         kwargs.setdefault("xlim", (-source_extent_α/2, source_extent_α/2))
         kwargs.setdefault("ylim", (-source_extent_β/2, source_extent_β/2))
@@ -844,17 +1021,27 @@ class IncoherentLightSimulation:
 
 
     def plot_mutual_coherence(self):
-        """
-        Plot the source mutual-coherence magnitude from the last calculation.
+        """Show how strongly the incident fields at two pupil points are correlated.
 
         Returns
         -------
-        ax: Matplotlib axes; separations are in micrometres and |Gamma| in W/m².
+        ax : Matplotlib axes
+            A map of |Γ| in W/m² against horizontal and vertical separation
+            in micrometres.
 
         Notes
         -----
-        Requires a previous get_farfield or full-grid get_irradiance call outside
-        JAX tracing. Compact-monitor calculations do not update this cached map.
+        Each point on this plot is a separation between two positions on the
+        pupil. At the origin the two positions coincide, so |Γ| there gives the
+        incident irradiance represented by the sampled source. The rest of the
+        map shows how the correlation changes as the positions move apart.
+        Equations (4) and (16) relate this function to the source radiance for
+        small and wide angles, respectively.
+
+        The map comes from the most recent calculation that stored it. After
+        changing the source, run get_farfield or a full-grid get_irradiance
+        outside JAX tracing to refresh it. A compact-monitor calculation or an
+        RS check leaves the previous map in place.
         """
         if self._last_gamma is None:
             raise ValueError("Run a simulation before plotting mutual coherence.")
@@ -864,23 +1051,27 @@ class IncoherentLightSimulation:
             colorbar_label=r"$|\Gamma|$ [W m$^{-2}$]", vmin=0)
 
     def plot_irradiance(self, E, **kwargs):
-        """
-        Plot irradiance using the monitor coordinates from the last calculation.
+        """Plot irradiance on the rectangular monitor used in your last calculation.
 
         Parameters
         ----------
-        E: irradiance array in W/m² on the latest rectangular monitor.
-        **kwargs: plot_intensity options, such as units, cmap, text, xlim, ylim,
-            slice_y_pos and slice_x_pos. irradiance_units=1e-3 displays mW/m².
+        E : array
+            Monitor irradiance in W/m².
+        **kwargs
+            Options for plot_intensity, including units, cmap, text, xlim,
+            ylim and the positions of cross-sections. Use irradiance_units=1e-3
+            to label the color scale in mW/m².
 
         Returns
         -------
-        ax: Matplotlib axes containing the irradiance map.
+        ax : Matplotlib axes
+            Axes containing the irradiance map.
 
         Notes
         -----
-        Call get_irradiance outside JAX tracing first to store the monitor axes.
-        Color limits refer to displayed values, including any square root.
+        Compute E with get_irradiance or get_irradiance_rs outside JAX tracing
+        so the simulator can remember the axes. If another calculation has since
+        changed the monitor, pass the original x, y and E to plot_intensity.
         """
         if not hasattr(self, "_irradiance_coordinates"):
             raise ValueError("Call get_irradiance before plot_irradiance.")
@@ -891,35 +1082,46 @@ class IncoherentLightSimulation:
                        xlim=None, ylim=None, grid=False, text=None, units=mm,
                        slice_y_pos=None, slice_x_pos=None, dark_background=False,
                        cmap="inferno", vmin=0, vmax=None, irradiance_units=1):
-        """
-        Plot irradiance on explicit monitor axes, with optional cross-sections.
+        """Plot irradiance on the supplied monitor axes and optionally show a line profile.
 
         Parameters
         ----------
-        x: one-dimensional horizontal monitor coordinates, in micrometres.
-        y: one-dimensional vertical monitor coordinates, in micrometres.
-        I: irradiance in W/m², with shape (len(y), len(x)).
-        square_root: display the square root of the irradiance if True.
-        figsize: figure width and height in inches.
-        xlim: optional horizontal display limits, in micrometres.
-        ylim: optional vertical display limits, in micrometres.
-        grid: show grid lines if True.
-        text: plot title; None uses the last propagation distance.
-        units: positive divisor for displayed spatial coordinates, default mm.
-        slice_y_pos: optional y position of a horizontal cross-section, in micrometres;
-            uses the nearest sampled row.
-        slice_x_pos: optional x position of a vertical cross-section, in micrometres;
-            uses the nearest sampled column.
-        dark_background: use Matplotlib's dark background if True.
-        cmap: Matplotlib colormap name or object.
-        vmin: lower color limit in displayed units, after any square root.
-        vmax: upper color limit in displayed units; None uses the data maximum.
-        irradiance_units: positive power-unit divisor; 1 displays W/m²,
-            1e-3 displays mW/m² and 1e-6 displays µW/m².
+        x, y : one-dimensional arrays
+            Horizontal and vertical monitor positions in micrometres.
+        I : array
+            Irradiance in W/m² with shape (len(y), len(x)).
+        square_root : bool
+            True displays the square root of the irradiance to reveal dim features.
+        figsize : pair
+            Figure width and height in inches.
+        xlim, ylim : pairs, optional
+            Visible intervals in micrometres.
+        grid : bool
+            True adds grid lines to the map.
+        text : str, optional
+            Plot title. By default the title gives the last propagation distance.
+        units : float
+            Positive divisor for the displayed positions. The default is mm.
+        slice_y_pos, slice_x_pos : floats, optional
+            A y position selects a horizontal profile and an x position selects a
+            vertical one. Supply positions in micrometres. The plot uses the
+            nearest sampled row or column.
+        dark_background : bool
+            True selects Matplotlib's dark background.
+        cmap : colormap or name
+            Matplotlib colormap.
+        vmin, vmax : floats, optional
+            Limits of the displayed color scale after unit conversion and any
+            square root. By default the scale starts at zero and ends at the
+            largest displayed value.
+        irradiance_units : float
+            Power unit for the display. Use 1 for W/m², 1e-3 for mW/m² or
+            1e-6 for µW/m².
 
         Returns
         -------
-        ax: Matplotlib axes containing the map; cross-sections use a second panel.
+        ax : Matplotlib axes
+            Axes containing the map. Any requested profiles share a second panel.
         """
         if not np.isfinite(irradiance_units) or irradiance_units <= 0:
             raise ValueError("irradiance_units must be finite and positive.")
@@ -955,29 +1157,36 @@ class IncoherentLightSimulation:
 
     def plot_farfield(self, alpha, beta, S, figsize=(7, 6), alpha_lim=None,
                       beta_lim=None, grid=False, text=None, dark_background=False):
-        """
-        Plot the angular output S returned by get_farfield.
+        """Display the far-field distribution S on a map of outgoing directions.
 
         Parameters
         ----------
-        alpha: one-dimensional horizontal direction-cosine axis.
-        beta: one-dimensional vertical direction-cosine axis.
-        S: radiant intensity divided by cos(theta), in picowatts/sr, with shape
-            (len(beta), len(alpha)).
-        figsize: figure width and height in inches.
-        alpha_lim: optional horizontal limits in direction-cosine coordinates.
-        beta_lim: optional vertical limits in direction-cosine coordinates.
-        grid: show grid lines if True.
-        text: plot title; None uses "Angular far field".
-        dark_background: use Matplotlib's dark background if True.
+        alpha, beta : one-dimensional arrays
+            Horizontal and vertical direction cosines returned by get_farfield.
+        S : array
+            Angular distribution returned by get_farfield, in picowatts per
+            steradian and with shape (len(beta), len(alpha)).
+        figsize : pair
+            Figure width and height in inches.
+        alpha_lim, beta_lim : pairs, optional
+            Visible intervals in direction cosines.
+        grid : bool
+            True adds grid lines.
+        text : str, optional
+            Plot title. The default is “Angular far field”.
+        dark_background : bool
+            True selects Matplotlib's dark background.
 
         Returns
         -------
-        ax: Matplotlib axes containing the angular map.
+        ax : Matplotlib axes
+            Axes containing the angular map.
 
         Notes
         -----
-        The display converts S to W/sr. Use to_radiant_intensity to obtain dP/dΩ.
+        The colorbar displays S in W/sr. S gives power when integrated over the
+        direction-cosine plane. For radiant intensity per unit solid angle, use
+        to_radiant_intensity to apply the cosine factor in Eq. (13).
         """
         plt.style.use("dark_background" if dark_background else "default")
         ax = self.plot_map(alpha, beta, S/W, ax=None, title=text or "Angular far field",
