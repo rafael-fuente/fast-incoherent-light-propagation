@@ -436,36 +436,29 @@ class MonochromaticField:
         return rgb
 
     def interpolate(self, Nx, Ny):
-        """Interpolate the field to the new shape (Nx,Ny)"""
+        """Resample the field in place to Ny rows and Nx columns using cubic splines."""
         from scipy.interpolate import RectBivariateSpline
 
+        to_numpy = bd.asnumpy if backend_name == "cupy" else np.asarray
+        x_old, y_old = to_numpy(self.x), to_numpy(self.y)
+        field = to_numpy(self.E)
 
-        if backend_name == 'cupy':
-            self.E = self.E.get()
+        # The first axis of the field is y and the second is x.
+        real_spline = RectBivariateSpline(y_old, x_old, field.real)
+        imag_spline = RectBivariateSpline(y_old, x_old, field.imag)
 
-        fun_real = RectBivariateSpline(
-                    self.dx*(np.arange(self.Nx)-self.Nx//2),
-                    self.dy*(np.arange(self.Ny)-self.Ny//2),
-                    np.real(self.E))
+        dx, dy = self.extent_x / Nx, self.extent_y / Ny
+        x = self.x[self.Nx // 2] + dx * (bd.arange(Nx) - Nx // 2)
+        y = self.y[self.Ny // 2] + dy * (bd.arange(Ny) - Ny // 2)
+        x_new, y_new = to_numpy(x), to_numpy(y)
+        new_field = bd.asarray(real_spline(y_new, x_new) + 1j * imag_spline(y_new, x_new))
+        xx, yy = bd.meshgrid(x, y)
 
-        fun_imag = RectBivariateSpline(
-                    self.dx*(np.arange(self.Nx)-self.Nx//2),
-                    self.dy*(np.arange(self.Ny)-self.Ny//2),
-                    np.imag(self.E))
-
-
-        self.Nx = Nx
-        self.Ny = Ny
-
-        self.dx = self.extent_x/Nx
-        self.dy = self.extent_y/Ny
-
-        self.E = bd.array(fun_real(self.dx*(np.arange(Nx)-Nx//2), self.dy*(np.arange(Ny)-Ny//2))  +  fun_imag(self.dx*(np.arange(Nx)-Nx//2), self.dy*(np.arange(Ny)-Ny//2))*1j)
-
-
-        self.x = self.dx*(bd.arange(Nx)-Nx//2)
-        self.y = self.dy*(bd.arange(Ny)-Ny//2)
-        self.xx, self.yy = bd.meshgrid(self.x, self.y)
+        self.Nx, self.Ny = Nx, Ny
+        self.dx, self.dy = dx, dy
+        self.x, self.y = x, y
+        self.xx, self.yy = xx, yy
+        self.E = new_field
 
 
 
